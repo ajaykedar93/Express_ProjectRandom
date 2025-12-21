@@ -1,0 +1,54 @@
+*************************************************NEW DOCUMENT RANDOM USER*****************************************************
+
+CREATE TABLE IF NOT EXISTS register_random (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  first_name    TEXT NOT NULL,
+  last_name     TEXT NOT NULL,
+  full_name     TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED,
+
+  mobile_number VARCHAR(15) NOT NULL,
+  email_address TEXT NOT NULL,
+
+  -- optional address fields
+  village_city  TEXT NULL,
+  pincode       VARCHAR(6) NULL,
+  state         TEXT NULL,
+  district      TEXT NULL,
+  taluka        TEXT NULL,
+
+  password_hash TEXT NOT NULL,        -- store hashed password only
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  CONSTRAINT uq_register_random_mobile UNIQUE (mobile_number),
+  CONSTRAINT uq_register_random_email UNIQUE (email_address)
+);
+
+
+************************************************************************************************************************************
+
+CREATE TABLE IF NOT EXISTS document_random (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  document_title  TEXT NOT NULL,                 -- mandatory identity/title
+  short_desc      TEXT NULL,                     -- optional
+
+  file_path       TEXT NOT NULL,                 -- local storage path
+  original_name   TEXT NOT NULL,                 -- uploaded filename
+  mime_type       TEXT NOT NULL,                 -- e.g. application/pdf
+  file_ext        TEXT NOT NULL,                 -- e.g. pdf, jpg, docx
+  file_size_bytes BIGINT NOT NULL CHECK (file_size_bytes >= 0),
+
+  checksum_sha256 TEXT NOT NULL,                 -- used to detect same doc
+  uploaded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),  -- stored in UTC, display in India time
+
+  CONSTRAINT uq_document_checksum UNIQUE (checksum_sha256)
+);
+
+-- (optional) for faster title search/suggestions
+CREATE INDEX IF NOT EXISTS idx_document_random_title ON document_random (document_title);
+
+
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
