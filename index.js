@@ -4,7 +4,8 @@ const cors = require("cors");
 const path = require("path");
 
 // ✅ DB connection (FIXED PATH)
-const pool = require("../db");
+const pool = require("./db");
+
 
 // Routes
 const forgotRouter = require("./routes/forgot");
