@@ -1,4 +1,5 @@
 require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -14,17 +15,34 @@ const app = express();
    MIDDLEWARE
 ========================= */
 
-// Enable CORS
-app.use(cors());
+// ✅ Body parsers (ONLY ONCE)
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-// Body parsers (use ONCE only)
-app.use(express.json({ limit: "2mb" })); // for JSON APIs
-app.use(express.urlencoded({ extended: true })); // for form-data (without files)
+// ✅ Serve uploaded files
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// Serve uploaded files (IMPORTANT for textdocs)
+// ✅ CORS (CRASH-PROOF)
+const allowedOrigins = [
+  process.env.FRONTEND_URL, // e.g. https://your-vercel-app.vercel.app
+  "http://localhost:3000",
+  "http://localhost:5173",
+].filter(Boolean);
+
 app.use(
-  "/uploads",
-  express.static(path.join(__dirname, "uploads"))
+  cors({
+    origin: (origin, cb) => {
+      // allow requests with no origin (Postman, server-to-server)
+      if (!origin) return cb(null, true);
+
+      // allow if in list
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+
+      // ❌ IMPORTANT: Do NOT throw error here (can crash some setups)
+      return cb(null, false);
+    },
+    credentials: true,
+  })
 );
 
 /* =========================
@@ -33,7 +51,6 @@ app.use(
 
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/auth/forgot", forgotRouter);
-
 app.use("/api/documents", documentRouter);
 app.use("/api/textdocs", textdocRoutes);
 
@@ -41,16 +58,28 @@ app.use("/api/textdocs", textdocRoutes);
    HEALTH CHECK
 ========================= */
 
-app.get("/", (req, res) => {
-  res.send("API running");
-});
+app.get("/", (req, res) => res.send("API running ✅"));
+
+app.get("/health", (req, res) =>
+  res.json({ ok: true, time: new Date().toISOString() })
+);
 
 /* =========================
-   ERROR HANDLER (SAFE)
+   ERROR HANDLER
 ========================= */
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
-  res.status(500).json({ message: "Internal Server Error" });
+  res.status(500).json({ message: err.message || "Internal Server Error" });
+});
+
+/* =========================
+   PROCESS SAFETY LOGS
+========================= */
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
 });
 
 /* =========================
@@ -60,4 +89,5 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✅ Server started on port ${PORT}`);
+
 });
