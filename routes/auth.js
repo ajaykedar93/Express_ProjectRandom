@@ -1,25 +1,18 @@
+// auth.js (USER ONLY)
 const express = require("express");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
 const pool = require("../db");
 
-// Mailer
 const { sendOTP, sendEmail } = require("../utils/mailer");
 
 const router = express.Router();
 
-/* ---------------- Admin config (SECURE) ---------------- */
-const ADMIN_USERS = String(process.env.ADMIN_USERS || "")
-  .split(",")
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
+const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret";
+const USER_TOKEN_EXP = process.env.USER_TOKEN_EXP || "7d";
 
-const ADMIN_PASSWORD_HASHES = String(process.env.ADMIN_PASSWORD_HASHES || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-/* ---------------- OTP STORE ---------------- */
+/* OTP store */
 const OTP_TTL_MS = 10 * 60 * 1000;
 const MAX_OTP_ATTEMPTS = 5;
 const OTP_RESEND_COOLDOWN_MS = 30 * 1000;
@@ -27,7 +20,7 @@ const OTP_RESEND_COOLDOWN_MS = 30 * 1000;
 const otpStoreByEmail = new Map();
 const verifiedEmailTokenStore = new Map();
 
-/* ---------------- Helpers ---------------- */
+/* helpers */
 const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
 const isValidEmail = (email) =>
   /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
@@ -41,7 +34,37 @@ function makeVerifyToken() {
   return crypto.randomBytes(24).toString("hex");
 }
 
-/* ---------------- SEND OTP ---------------- */
+/* ✅ user jwt verify + token_version check */
+async function requireUserJWT(req, res, next) {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) return res.status(401).json({ message: "Missing token" });
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded?.id) return res.status(401).json({ message: "Invalid token" });
+
+    const db = await pool.query(
+      "SELECT token_version FROM register_random WHERE id=$1 LIMIT 1",
+      [decoded.id]
+    );
+    if (db.rowCount === 0) return res.status(401).json({ message: "User not found" });
+
+    const dbVer = Number(db.rows[0].token_version || 0);
+    const tokVer = Number(decoded.token_version || 0);
+
+    if (dbVer !== tokVer) {
+      return res.status(401).json({ message: "Session expired. Please login again." });
+    }
+
+    req.user = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+}
+
+/* SEND OTP */
 router.post("/send-otp", async (req, res) => {
   try {
     const email_address = normalizeEmail(req.body.email_address);
@@ -80,7 +103,7 @@ router.post("/send-otp", async (req, res) => {
   }
 });
 
-/* ---------------- VERIFY OTP ---------------- */
+/* VERIFY OTP */
 router.post("/verify-otp", async (req, res) => {
   try {
     const email_address = normalizeEmail(req.body.email_address);
@@ -120,7 +143,7 @@ router.post("/verify-otp", async (req, res) => {
   }
 });
 
-/* ---------------- Register ---------------- */
+/* REGISTER */
 router.post("/register", async (req, res) => {
   try {
     const {
@@ -129,6 +152,7 @@ router.post("/register", async (req, res) => {
     } = req.body;
 
     const email = normalizeEmail(email_address);
+
     if (!first_name || !last_name || !mobile_number || !email || !password)
       return res.status(400).json({ message: "Required fields missing" });
     if (!isValidMobile10(mobile_number))
@@ -140,6 +164,7 @@ router.post("/register", async (req, res) => {
 
     if (!verify_token)
       return res.status(400).json({ message: "Email verification required" });
+
     const tokenRec = verifiedEmailTokenStore.get(verify_token);
     if (!tokenRec || Date.now() > tokenRec.expiresAt || tokenRec.email !== email)
       return res.status(401).json({ message: "Invalid verify_token" });
@@ -182,7 +207,7 @@ router.post("/register", async (req, res) => {
   }
 });
 
-/* ---------------- Login (User) ---------------- */
+/* LOGIN */
 router.post("/login", async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -204,8 +229,15 @@ router.post("/login", async (req, res) => {
     const ok = await bcrypt.compare(String(password), user.password_hash);
     if (!ok) return res.status(401).json({ message: "Invalid credentials" });
 
+    const token = jwt.sign(
+      { id: user.id, role: "user", token_version: Number(user.token_version || 0) },
+      JWT_SECRET,
+      { expiresIn: USER_TOKEN_EXP }
+    );
+
     return res.json({
       message: "Login success",
+      token,
       user: {
         id: user.id,
         first_name: user.first_name,
@@ -227,56 +259,23 @@ router.post("/login", async (req, res) => {
   }
 });
 
-/* ---------------- NEW: Admin Login (SECURE) ---------------- */
-// ---------------- ADMIN LOGIN ----------------
-// POST /api/auth/admin-login
-router.post("/admin-login", async (req, res) => {
+/* ✅ USER SELF LOGOUT */
+router.post("/logout", requireUserJWT, async (req, res) => {
   try {
-    const { username, password } = req.body;
-
-    if (!username || !password) {
-      return res.status(400).json({ message: "Username & password required" });
-    }
-
-    const email = String(username).trim().toLowerCase();
-
-    const ADMIN_USERS = String(process.env.ADMIN_USERS || "")
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-
-    const ADMIN_PASSWORD_HASHES = String(process.env.ADMIN_PASSWORD_HASHES || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    if (!ADMIN_USERS.includes(email)) {
-      return res.status(401).json({ message: "Not an admin" });
-    }
-
-    let ok = false;
-    for (const hash of ADMIN_PASSWORD_HASHES) {
-      if (await bcrypt.compare(String(password), hash)) {
-        ok = true;
-        break;
-      }
-    }
-
-    if (!ok) {
-      return res.status(401).json({ message: "Invalid credentials" });
-    }
-
-    return res.json({
-      message: "Admin login success",
-      user: { role: "admin", email_address: email },
-    });
+    await pool.query(
+      `UPDATE register_random
+       SET token_version = token_version + 1
+       WHERE id = $1`,
+      [req.user.id]
+    );
+    return res.json({ message: "Logged out successfully" });
   } catch (err) {
-    console.error("ADMIN LOGIN ERROR:", err);
+    console.error("LOGOUT ERROR:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });
 
-/* ---------------- Users CRUD (unchanged) ---------------- */
+/* USERS LIST/CRUD (same) */
 router.get("/users", async (req, res) => {
   try {
     const result = await pool.query(

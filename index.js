@@ -9,6 +9,11 @@ const forgotRouter = require("./routes/forgot");
 const documentRouter = require("./routes/document");
 const textdocRoutes = require("./routes/textdoc");
 
+// ✅ Footer Route (ADDED)
+const footerRoutes = require("./routes/footer");
+const adminRoutes = require("./routes/admin");
+
+
 const app = express();
 
 /* =========================
@@ -54,6 +59,11 @@ app.use("/api/auth/forgot", forgotRouter);
 app.use("/api/documents", documentRouter);
 app.use("/api/textdocs", textdocRoutes);
 
+// ✅ Footer API (ADDED)
+app.use("/api/footer", footerRoutes);
+
+app.use("/admin", adminRoutes);
+
 /* =========================
    HEALTH CHECK
 ========================= */
@@ -89,5 +99,4 @@ process.on("uncaughtException", (err) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✅ Server started on port ${PORT}`);
-
 });

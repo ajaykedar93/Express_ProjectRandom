@@ -4,9 +4,25 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const mime = require("mime-types");
-const pool = require("../db");
+const pool = require("../db"); // ✅ as you requested
 
 const router = express.Router();
+
+/* =======================
+   ✅ AUTH (REQUIRED)
+   You must have login middleware that sets req.user = { id: ... }
+   If you don't, this fallback uses header: x-user-id (temporary only)
+======================= */
+function requireAuth(req, res, next) {
+  const idFromReqUser = req.user?.id || req.user?.user_id;
+  const idFromHeader = req.headers["x-user-id"]; // fallback (temporary)
+
+  const userId = idFromReqUser || idFromHeader;
+  if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+  req.authUserId = userId;
+  next();
+}
 
 /* =======================
    Local storage settings
@@ -31,10 +47,9 @@ const storage = multer.diskStorage({
   },
 });
 
-// Allow any file type
 const upload = multer({
   storage,
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB (change if needed)
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
 });
 
 /* =======================
@@ -53,7 +68,6 @@ function sha256File(filePath) {
 function getFileExt(originalName, mimeType) {
   const extFromName = path.extname(originalName || "").replace(".", "").toLowerCase();
   if (extFromName) return extFromName;
-
   const extFromMime = mime.extension(mimeType || "");
   return (extFromMime || "bin").toLowerCase();
 }
@@ -69,8 +83,7 @@ async function fileExists(p) {
 
 async function deleteLocalFile(p) {
   if (!p) return;
-  const ok = await fileExists(p);
-  if (!ok) return;
+  if (!(await fileExists(p))) return;
   try {
     await fs.promises.unlink(p);
   } catch (e) {
@@ -79,17 +92,19 @@ async function deleteLocalFile(p) {
 }
 
 /* =========================================================
-   POST /api/documents
-   Upload document (multipart/form-data)
-   fields:
+   ✅ POST /api/documents
+   Upload document (only logged-in user)
+   multipart/form-data:
      document_title (required)
      short_desc (optional)
      file (required)
 ========================================================= */
-router.post("/", upload.single("file"), async (req, res) => {
+router.post("/", requireAuth, upload.single("file"), async (req, res) => {
   let savedPath = null;
 
   try {
+    const user_id = req.authUserId;
+
     const document_title = String(req.body.document_title || "").trim();
     const short_desc = req.body.short_desc ? String(req.body.short_desc).trim() : null;
 
@@ -101,8 +116,8 @@ router.post("/", upload.single("file"), async (req, res) => {
       return res.status(400).json({ message: "file is required" });
     }
 
-    savedPath = req.file.path; // absolute path in server
-    const file_path = savedPath; // store absolute OR change to relative if you want
+    savedPath = req.file.path;
+    const file_path = savedPath;
     const original_name = req.file.originalname;
     const mime_type = req.file.mimetype || mime.lookup(req.file.filename) || "application/octet-stream";
     const file_ext = getFileExt(original_name, mime_type);
@@ -110,23 +125,24 @@ router.post("/", upload.single("file"), async (req, res) => {
 
     const checksum_sha256 = await sha256File(savedPath);
 
-    // ✅ block duplicates (by checksum)
+    // ✅ Duplicate check ONLY FOR SAME USER (not global)
     const dup = await pool.query(
-      `SELECT id FROM document_random WHERE checksum_sha256=$1 LIMIT 1`,
-      [checksum_sha256]
+      `SELECT id FROM document_random WHERE user_id=$1 AND checksum_sha256=$2 LIMIT 1`,
+      [user_id, checksum_sha256]
     );
     if (dup.rows.length > 0) {
       await deleteLocalFile(savedPath);
-      return res.status(409).json({ message: "Same document already uploaded (duplicate checksum)" });
+      return res.status(409).json({ message: "Same document already uploaded (duplicate)" });
     }
 
     const result = await pool.query(
       `INSERT INTO document_random
-        (document_title, short_desc, file_path, original_name, mime_type, file_ext, file_size_bytes, checksum_sha256)
+        (user_id, document_title, short_desc, file_path, original_name, mime_type, file_ext, file_size_bytes, checksum_sha256)
        VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8)
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
       [
+        user_id,
         document_title,
         short_desc,
         file_path,
@@ -141,30 +157,34 @@ router.post("/", upload.single("file"), async (req, res) => {
     return res.status(201).json({ message: "Document uploaded", document: result.rows[0] });
   } catch (err) {
     console.error("UPLOAD ERROR:", err);
-
-    // if error after saving file, cleanup
     if (savedPath) await deleteLocalFile(savedPath);
-
     return res.status(500).json({ message: "Server error" });
   }
 });
 
 /* =========================================================
-   GET /api/documents
-   List documents (optional query ?q=)
+   ✅ GET /api/documents
+   List only logged-in user's documents
+   Optional: ?q=
 ========================================================= */
-router.get("/", async (req, res) => {
+router.get("/", requireAuth, async (req, res) => {
   try {
+    const user_id = req.authUserId;
     const q = String(req.query.q || "").trim().toLowerCase();
 
     const result = q
       ? await pool.query(
           `SELECT * FROM document_random
-           WHERE LOWER(document_title) LIKE '%' || $1 || '%'
+           WHERE user_id=$1 AND LOWER(document_title) LIKE '%' || $2 || '%'
            ORDER BY uploaded_at DESC`,
-          [q]
+          [user_id, q]
         )
-      : await pool.query(`SELECT * FROM document_random ORDER BY uploaded_at DESC`);
+      : await pool.query(
+          `SELECT * FROM document_random
+           WHERE user_id=$1
+           ORDER BY uploaded_at DESC`,
+          [user_id]
+        );
 
     return res.json(result.rows);
   } catch (err) {
@@ -174,14 +194,18 @@ router.get("/", async (req, res) => {
 });
 
 /* =========================================================
-   GET /api/documents/:id
-   Get single document metadata
+   ✅ GET /api/documents/:id
+   Get single document metadata (only owner)
 ========================================================= */
-router.get("/:id", async (req, res) => {
+router.get("/:id", requireAuth, async (req, res) => {
   try {
+    const user_id = req.authUserId;
     const { id } = req.params;
 
-    const result = await pool.query(`SELECT * FROM document_random WHERE id=$1`, [id]);
+    const result = await pool.query(
+      `SELECT * FROM document_random WHERE id=$1 AND user_id=$2`,
+      [id, user_id]
+    );
     if (result.rows.length === 0) return res.status(404).json({ message: "Document not found" });
 
     return res.json(result.rows[0]);
@@ -192,14 +216,18 @@ router.get("/:id", async (req, res) => {
 });
 
 /* =========================================================
-   GET /api/documents/:id/download
-   Download the stored file
+   ✅ GET /api/documents/:id/download
+   Download (only owner)
 ========================================================= */
-router.get("/:id/download", async (req, res) => {
+router.get("/:id/download", requireAuth, async (req, res) => {
   try {
+    const user_id = req.authUserId;
     const { id } = req.params;
 
-    const result = await pool.query(`SELECT * FROM document_random WHERE id=$1`, [id]);
+    const result = await pool.query(
+      `SELECT * FROM document_random WHERE id=$1 AND user_id=$2`,
+      [id, user_id]
+    );
     if (result.rows.length === 0) return res.status(404).json({ message: "Document not found" });
 
     const doc = result.rows[0];
@@ -209,7 +237,6 @@ router.get("/:id/download", async (req, res) => {
       return res.status(404).json({ message: "File missing on server storage" });
     }
 
-    // set download name
     res.setHeader(
       "Content-Disposition",
       `attachment; filename="${encodeURIComponent(doc.original_name)}"`
@@ -224,28 +251,35 @@ router.get("/:id/download", async (req, res) => {
 });
 
 /* =========================================================
-   PUT /api/documents/:id
-   Update title/desc OR replace file
-   - multipart/form-data supported:
-       document_title (optional)
-       short_desc (optional)
-       file (optional replace)
+   ✅ PUT /api/documents/:id
+   Update title/desc OR replace file (only owner)
+   multipart/form-data:
+     document_title (optional)
+     short_desc (optional)
+     file (optional)
 ========================================================= */
-router.put("/:id", upload.single("file"), async (req, res) => {
+router.put("/:id", requireAuth, upload.single("file"), async (req, res) => {
   let newSavedPath = null;
 
   try {
+    const user_id = req.authUserId;
     const { id } = req.params;
 
-    const existingRes = await pool.query(`SELECT * FROM document_random WHERE id=$1`, [id]);
+    // ✅ must be owner
+    const existingRes = await pool.query(
+      `SELECT * FROM document_random WHERE id=$1 AND user_id=$2`,
+      [id, user_id]
+    );
     if (existingRes.rows.length === 0) {
       if (req.file?.path) await deleteLocalFile(req.file.path);
       return res.status(404).json({ message: "Document not found" });
     }
     const existing = existingRes.rows[0];
 
-    const document_title = req.body.document_title ? String(req.body.document_title).trim() : null;
-    const short_desc = req.body.short_desc !== undefined ? String(req.body.short_desc).trim() : null;
+    const document_title =
+      req.body.document_title !== undefined ? String(req.body.document_title).trim() : null;
+    const short_desc =
+      req.body.short_desc !== undefined ? String(req.body.short_desc).trim() : null;
 
     let file_path = null;
     let original_name = null;
@@ -254,7 +288,6 @@ router.put("/:id", upload.single("file"), async (req, res) => {
     let file_size_bytes = null;
     let checksum_sha256 = null;
 
-    // If replacing file
     if (req.file) {
       newSavedPath = req.file.path;
 
@@ -265,14 +298,16 @@ router.put("/:id", upload.single("file"), async (req, res) => {
       file_size_bytes = Number(req.file.size || 0);
       checksum_sha256 = await sha256File(newSavedPath);
 
-      // prevent checksum duplicate with another row
+      // ✅ duplicate check for SAME USER only
       const dup = await pool.query(
-        `SELECT id FROM document_random WHERE checksum_sha256=$1 AND id<>$2 LIMIT 1`,
-        [checksum_sha256, id]
+        `SELECT id FROM document_random
+         WHERE user_id=$1 AND checksum_sha256=$2 AND id<>$3
+         LIMIT 1`,
+        [user_id, checksum_sha256, id]
       );
       if (dup.rows.length > 0) {
         await deleteLocalFile(newSavedPath);
-        return res.status(409).json({ message: "Another document already exists with same checksum" });
+        return res.status(409).json({ message: "Duplicate document already exists" });
       }
     }
 
@@ -286,7 +321,7 @@ router.put("/:id", upload.single("file"), async (req, res) => {
         file_ext        = COALESCE($6, file_ext),
         file_size_bytes = COALESCE($7, file_size_bytes),
         checksum_sha256 = COALESCE($8, checksum_sha256)
-       WHERE id=$9
+       WHERE id=$9 AND user_id=$10
        RETURNING *`,
       [
         document_title,
@@ -298,10 +333,11 @@ router.put("/:id", upload.single("file"), async (req, res) => {
         file_size_bytes,
         checksum_sha256,
         id,
+        user_id,
       ]
     );
 
-    // If file was replaced successfully, delete old file
+    // ✅ delete old file if replaced
     if (req.file && existing.file_path && existing.file_path !== file_path) {
       await deleteLocalFile(existing.file_path);
     }
@@ -309,29 +345,33 @@ router.put("/:id", upload.single("file"), async (req, res) => {
     return res.json({ message: "Updated successfully", document: updated.rows[0] });
   } catch (err) {
     console.error("UPDATE DOC ERROR:", err);
-
-    // cleanup new uploaded file if update fails
     if (newSavedPath) await deleteLocalFile(newSavedPath);
-
     return res.status(500).json({ message: "Server error" });
   }
 });
 
 /* =========================================================
-   DELETE /api/documents/:id
-   Delete record + delete local file
+   ✅ DELETE /api/documents/:id
+   Delete (only owner) + delete local file
 ========================================================= */
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", requireAuth, async (req, res) => {
   try {
+    const user_id = req.authUserId;
     const { id } = req.params;
 
-    const existingRes = await pool.query(`SELECT * FROM document_random WHERE id=$1`, [id]);
+    const existingRes = await pool.query(
+      `SELECT * FROM document_random WHERE id=$1 AND user_id=$2`,
+      [id, user_id]
+    );
     if (existingRes.rows.length === 0) return res.status(404).json({ message: "Document not found" });
+
     const doc = existingRes.rows[0];
 
-    const del = await pool.query(`DELETE FROM document_random WHERE id=$1 RETURNING id`, [id]);
+    const del = await pool.query(
+      `DELETE FROM document_random WHERE id=$1 AND user_id=$2 RETURNING id`,
+      [id, user_id]
+    );
 
-    // delete local file
     await deleteLocalFile(doc.file_path);
 
     return res.json({ message: "Deleted successfully", id: del.rows[0].id });
